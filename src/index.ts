@@ -10,7 +10,9 @@ import {
   type RunResult,
   type ThreadItem,
 } from "@openai/codex-sdk";
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, writeFile, mkdir, unlink } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { open } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { execFile as execFileCb } from "node:child_process";
@@ -154,6 +156,294 @@ async function cleanupWorktree(wt: WorktreeInfo): Promise<{ hasChanges: boolean 
     }
     return { hasChanges: false };
   }
+}
+
+// --- Team infrastructure types ---
+
+interface TeamMember {
+  name: string;
+  agentId: string;
+  agentType: string;
+}
+
+interface TeamConfig {
+  team_name: string;
+  description?: string;
+  members: TeamMember[];
+}
+
+interface InboxMessage {
+  id: string;
+  from: string;
+  content: string;
+  summary?: string;
+  timestamp: string;
+  read: boolean;
+  type?: string;         // "message" | "shutdown_request" | etc.
+  request_id?: string;   // for shutdown_request
+}
+
+type TeamMessage =
+  | { type: "message"; recipient: string; content: string; summary: string }
+  | { type: "broadcast"; content: string; summary: string }
+  | { type: "shutdown_response"; request_id: string; approve: boolean; content?: string };
+
+// --- Team path utilities ---
+
+function teamDir(teamName: string): string {
+  return join(homedir(), ".claude", "teams", teamName);
+}
+
+function inboxDir(teamName: string, agentName: string): string {
+  return join(homedir(), ".claude", "teams", teamName, "inboxes", agentName);
+}
+
+function tasksDir(teamName: string): string {
+  return join(homedir(), ".claude", "tasks", teamName);
+}
+
+// --- Team file I/O layer ---
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+async function readTeamConfig(teamName: string): Promise<TeamConfig> {
+  try {
+    const raw = await readFile(join(teamDir(teamName), "config.json"), "utf-8");
+    return JSON.parse(raw) as TeamConfig;
+  } catch {
+    return { team_name: teamName, members: [] };
+  }
+}
+
+async function writeTeamConfig(
+  teamName: string,
+  config: TeamConfig,
+): Promise<void> {
+  const dir = teamDir(teamName);
+  await mkdir(dir, { recursive: true });
+  await writeFile(join(dir, "config.json"), JSON.stringify(config, null, 2));
+}
+
+async function withTeamLock<T>(
+  teamName: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const lockPath = join(teamDir(teamName), ".lock");
+  await mkdir(teamDir(teamName), { recursive: true });
+
+  let fd: import("node:fs/promises").FileHandle | null = null;
+  for (let attempt = 0; attempt < 20; attempt++) {
+    try {
+      fd = await open(lockPath, fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY);
+      break;
+    } catch {
+      await sleep(100);
+    }
+  }
+  if (!fd) {
+    throw new Error(`[task-external] Failed to acquire team lock for ${teamName}`);
+  }
+
+  try {
+    return await fn();
+  } finally {
+    await fd.close();
+    await unlink(lockPath).catch(() => {});
+  }
+}
+
+async function addMember(
+  teamName: string,
+  member: TeamMember,
+): Promise<void> {
+  await withTeamLock(teamName, async () => {
+    const config = await readTeamConfig(teamName);
+    if (!config.members.some((m) => m.name === member.name)) {
+      config.members.push(member);
+      await writeTeamConfig(teamName, config);
+    }
+  });
+}
+
+async function removeMember(
+  teamName: string,
+  agentName: string,
+): Promise<void> {
+  await withTeamLock(teamName, async () => {
+    const config = await readTeamConfig(teamName);
+    config.members = config.members.filter((m) => m.name !== agentName);
+    await writeTeamConfig(teamName, config);
+  });
+}
+
+async function appendInboxMessage(
+  teamName: string,
+  agentName: string,
+  msg: Omit<InboxMessage, "id" | "timestamp" | "read">,
+): Promise<void> {
+  const dir = inboxDir(teamName, agentName);
+  await mkdir(dir, { recursive: true });
+  const filePath = join(dir, "messages.json");
+
+  let messages: InboxMessage[] = [];
+  try {
+    const raw = await readFile(filePath, "utf-8");
+    messages = JSON.parse(raw) as InboxMessage[];
+  } catch {
+    // file doesn't exist yet
+  }
+
+  const full: InboxMessage = {
+    ...msg,
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    timestamp: new Date().toISOString(),
+    read: false,
+  };
+  messages.push(full);
+  await writeFile(filePath, JSON.stringify(messages, null, 2));
+
+  console.error(
+    `[task-external] Inbox message appended: ${teamName}/${agentName} from=${msg.from}`,
+  );
+}
+
+async function drainInbox(
+  teamName: string,
+  agentName: string,
+): Promise<InboxMessage[]> {
+  const filePath = join(inboxDir(teamName, agentName), "messages.json");
+
+  let messages: InboxMessage[] = [];
+  try {
+    const raw = await readFile(filePath, "utf-8");
+    messages = JSON.parse(raw) as InboxMessage[];
+  } catch {
+    return [];
+  }
+
+  const unread = messages.filter((m) => !m.read);
+  if (unread.length === 0) return [];
+
+  // Mark as read
+  for (const m of unread) {
+    m.read = true;
+  }
+  await writeFile(filePath, JSON.stringify(messages, null, 2));
+  return unread;
+}
+
+async function pollInbox(
+  teamName: string,
+  agentName: string,
+  signal?: AbortSignal,
+): Promise<InboxMessage[]> {
+  const MAX_POLLS = 150; // 150 * 2s = 300s
+  for (let i = 0; i < MAX_POLLS; i++) {
+    if (signal?.aborted) return [];
+    const msgs = await drainInbox(teamName, agentName);
+    if (msgs.length > 0) return msgs;
+    await sleep(2000);
+  }
+  console.error(
+    `[task-external] pollInbox timeout: ${teamName}/${agentName}`,
+  );
+  return [];
+}
+
+// --- Team message parsing + prompt injection ---
+
+const TEAM_AGENT_SYSTEM_PROMPT_SUFFIX = `
+You are operating as a teammate in a collaborative agent team.
+
+To send messages to other agents, include markers in your output using this exact format:
+
+<!--SEND_MESSAGE
+{"type":"message","recipient":"agent-name","content":"Your message here","summary":"Brief summary"}
+-->
+
+To broadcast to all teammates:
+<!--SEND_MESSAGE
+{"type":"broadcast","content":"Message to all","summary":"Brief summary"}
+-->
+
+When you receive a shutdown_request, respond with:
+<!--SEND_MESSAGE
+{"type":"shutdown_response","request_id":"the-request-id","approve":true}
+-->
+
+You can place these markers anywhere in your output. Any text outside the markers will be treated as your response to the team leader.
+
+IMPORTANT: Always use the <!--SEND_MESSAGE ... --> format for inter-agent communication. Plain text output alone will not be delivered to other agents.
+`.trim();
+
+const SEND_MESSAGE_RE = /<!--SEND_MESSAGE\n([\s\S]*?)\n-->/g;
+
+function parseAgentOutput(output: string): {
+  cleanText: string;
+  messages: TeamMessage[];
+  isShuttingDown: boolean;
+} {
+  const messages: TeamMessage[] = [];
+  let isShuttingDown = false;
+
+  const cleanText = output.replace(SEND_MESSAGE_RE, (_, jsonStr: string) => {
+    try {
+      const parsed = JSON.parse(jsonStr);
+      if (parsed.type === "message" && parsed.recipient && parsed.content) {
+        messages.push({
+          type: "message",
+          recipient: parsed.recipient,
+          content: parsed.content,
+          summary: parsed.summary ?? "",
+        });
+      } else if (parsed.type === "broadcast" && parsed.content) {
+        messages.push({
+          type: "broadcast",
+          content: parsed.content,
+          summary: parsed.summary ?? "",
+        });
+      } else if (parsed.type === "shutdown_response") {
+        messages.push({
+          type: "shutdown_response",
+          request_id: parsed.request_id,
+          approve: !!parsed.approve,
+          content: parsed.content,
+        });
+        if (parsed.approve) {
+          isShuttingDown = true;
+        }
+      }
+    } catch (err) {
+      console.error(
+        `[task-external] Failed to parse SEND_MESSAGE marker: ${err instanceof Error ? err.message : err}`,
+      );
+    }
+    return "";
+  }).trim();
+
+  return { cleanText, messages, isShuttingDown };
+}
+
+const AGENT_COLORS = [
+  "\x1b[36m", // cyan
+  "\x1b[33m", // yellow
+  "\x1b[35m", // magenta
+  "\x1b[32m", // green
+  "\x1b[34m", // blue
+  "\x1b[91m", // bright red
+  "\x1b[96m", // bright cyan
+  "\x1b[93m", // bright yellow
+];
+const RESET_COLOR = "\x1b[0m";
+const agentColorMap = new Map<string, string>();
+
+function resolveAgentColor(agentName: string): string {
+  let color = agentColorMap.get(agentName);
+  if (!color) {
+    color = AGENT_COLORS[agentColorMap.size % AGENT_COLORS.length]!;
+    agentColorMap.set(agentName, color);
+  }
+  return color;
 }
 
 // --- Mapping tables ---
@@ -387,6 +677,38 @@ server.tool(
 
       const effectiveIsolation = isolation ?? agentDef?.isolation;
 
+      // --- Team mode: fire-and-forget with message loop ---
+      if (team_name && name) {
+        const agentName = name;
+
+        // Fire-and-forget: launch background team agent loop
+        runTeamAgent({
+          teamName: team_name,
+          agentName,
+          agentType: subagent_type,
+          prompt: finalPrompt,
+          threadOptions,
+          description,
+        }).catch((err) => {
+          console.error(
+            `[task-external] Team agent "${agentName}" crashed: ${err instanceof Error ? err.message : err}`,
+          );
+        });
+
+        console.error(
+          `[task-external] Team agent spawned: ${agentName}@${team_name}`,
+        );
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Spawned successfully.\nagent_id: ${agentName}@${team_name}\nname: ${agentName}\nteam_name: ${team_name}\nThe agent is now running and will receive instructions via mailbox.`,
+            },
+          ],
+        };
+      }
+
       // --- Background execution path ---
       if (run_in_background) {
         const outputFile = join(
@@ -558,6 +880,167 @@ server.tool(
   },
 );
 
+// --- Team agent message loop ---
+
+interface RunTeamAgentParams {
+  teamName: string;
+  agentName: string;
+  agentType: string;
+  prompt: string;
+  threadOptions: ThreadOptions;
+  description: string;
+}
+
+async function runTeamAgent(params: RunTeamAgentParams): Promise<void> {
+  const { teamName, agentName, agentType, prompt, threadOptions, description } =
+    params;
+  const color = resolveAgentColor(agentName);
+  const log = (msg: string) =>
+    console.error(`${color}[team:${teamName}/${agentName}]${RESET_COLOR} ${msg}`);
+
+  // 1. Register member in config.json
+  const agentId = `${agentName}@${teamName}`;
+  await addMember(teamName, { name: agentName, agentId, agentType });
+  log(`Registered as member (agentId=${agentId})`);
+
+  const thread = codex.startThread(threadOptions);
+
+  try {
+    // 2. First turn with TEAM_AGENT_SYSTEM_PROMPT_SUFFIX injected
+    const fullPrompt = `${TEAM_AGENT_SYSTEM_PROMPT_SUFFIX}\n\n---\n\nYour name is "${agentName}" and you are on team "${teamName}".\n\n${prompt}`;
+    let currentInput = fullPrompt;
+    let turnCount = 0;
+
+    while (true) {
+      turnCount++;
+      log(`Starting turn ${turnCount}...`);
+
+      const controller = new AbortController();
+      const timeoutHandle = setTimeout(
+        () => controller.abort(),
+        DEFAULT_TIMEOUT_MS,
+      );
+
+      let turn: RunResult;
+      try {
+        turn = await thread.run(currentInput, { signal: controller.signal });
+      } finally {
+        clearTimeout(timeoutHandle);
+      }
+
+      const output = turn.finalResponse ?? "";
+      log(`Turn ${turnCount} completed (${output.length} chars)`);
+
+      // 3. Parse output for markers
+      const { cleanText, messages, isShuttingDown } = parseAgentOutput(output);
+
+      // 4. Deliver messages
+      for (const msg of messages) {
+        if (msg.type === "message") {
+          await appendInboxMessage(teamName, msg.recipient, {
+            from: agentName,
+            content: msg.content,
+            summary: msg.summary,
+            type: "message",
+          });
+          log(`Sent message to ${msg.recipient}`);
+        } else if (msg.type === "broadcast") {
+          // Send to all members except self
+          const config = await readTeamConfig(teamName);
+          for (const member of config.members) {
+            if (member.name !== agentName) {
+              await appendInboxMessage(teamName, member.name, {
+                from: agentName,
+                content: msg.content,
+                summary: msg.summary,
+                type: "message",
+              });
+            }
+          }
+          log(`Broadcast sent to ${config.members.length - 1} members`);
+        } else if (msg.type === "shutdown_response" && msg.approve) {
+          // Send shutdown_approved to team-lead
+          await appendInboxMessage(teamName, "team-lead", {
+            from: agentName,
+            content: JSON.stringify({
+              type: "shutdown_approved",
+              agent: agentName,
+            }),
+            summary: `${agentName} shutdown approved`,
+            type: "shutdown_approved",
+          });
+          log("Shutdown approved, exiting loop");
+        }
+      }
+
+      // 5. If shutting down, break out of loop
+      if (isShuttingDown) {
+        log("Agent shutting down");
+        break;
+      }
+
+      // 6. Send idle_notification to team-lead
+      if (cleanText) {
+        await appendInboxMessage(teamName, "team-lead", {
+          from: agentName,
+          content: cleanText,
+          summary: `${agentName} completed turn ${turnCount}`,
+          type: "idle_notification",
+        });
+      } else {
+        await appendInboxMessage(teamName, "team-lead", {
+          from: agentName,
+          content: JSON.stringify({
+            type: "idle",
+            agent: agentName,
+            turn: turnCount,
+          }),
+          summary: `${agentName} is idle after turn ${turnCount}`,
+          type: "idle_notification",
+        });
+      }
+
+      // 7. Poll inbox for next message
+      log("Polling inbox for next message...");
+      const inboxMessages = await pollInbox(teamName, agentName);
+      if (inboxMessages.length === 0) {
+        log("Poll timeout, exiting loop");
+        break;
+      }
+
+      // Check for shutdown_request
+      const shutdownReq = inboxMessages.find(
+        (m) => m.type === "shutdown_request",
+      );
+      if (shutdownReq) {
+        // Pass shutdown to the agent so it can cleanly respond
+        currentInput = `You have received a shutdown request (request_id: "${shutdownReq.request_id ?? shutdownReq.id}"). Please wrap up and respond with a shutdown_response marker to approve the shutdown:\n<!--SEND_MESSAGE\n{"type":"shutdown_response","request_id":"${shutdownReq.request_id ?? shutdownReq.id}","approve":true}\n-->`;
+        continue;
+      }
+
+      // Concatenate all messages as next input
+      currentInput = inboxMessages
+        .map(
+          (m) =>
+            `[Message from ${m.from}${m.type ? ` (${m.type})` : ""}]:\n${m.content}`,
+        )
+        .join("\n\n---\n\n");
+    }
+
+    log(`Agent loop ended after ${turnCount} turns`);
+  } catch (err) {
+    log(
+      `Error: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  } finally {
+    // Clean up: remove member from config
+    await removeMember(teamName, agentName).catch((e) =>
+      log(`Failed to remove member: ${e}`),
+    );
+    log("Member removed from config");
+  }
+}
+
 interface FormatOptions {
   threadId: string | null;
   worktreePath?: string;
@@ -610,6 +1093,157 @@ function formatTurnResult(turn: RunResult, options: FormatOptions): string {
 
   return parts.join("\n");
 }
+
+// --- SendMessage tool ---
+
+server.tool(
+  "SendMessage",
+  "Send a message to a specific agent or broadcast to all agents in a team. Use this to coordinate between team members.",
+  {
+    type: z
+      .enum(["message", "broadcast", "shutdown_request", "shutdown_response", "plan_approval_response"])
+      .describe("Message type"),
+    recipient: z
+      .string()
+      .optional()
+      .describe("Target agent name (required for message, shutdown_request, plan_approval_response)"),
+    content: z
+      .string()
+      .optional()
+      .describe("Message body"),
+    summary: z
+      .string()
+      .optional()
+      .describe("Short summary (5-10 words) shown as preview"),
+    request_id: z
+      .string()
+      .optional()
+      .describe("Request ID to respond to (required for shutdown_response, plan_approval_response)"),
+    approve: z
+      .boolean()
+      .optional()
+      .describe("Whether to approve (for shutdown_response, plan_approval_response)"),
+    team_name: z
+      .string()
+      .describe("Team name the sender belongs to"),
+    sender_name: z
+      .string()
+      .describe("Name of the sending agent"),
+  },
+  async (params) => {
+    const { type, recipient, content, summary, request_id, approve, team_name, sender_name } = params;
+
+    console.error(
+      `[task-external] SendMessage: type=${type}, sender=${sender_name}, team=${team_name}, recipient=${recipient ?? "(broadcast)"}`,
+    );
+
+    try {
+      if (type === "message") {
+        if (!recipient) {
+          return {
+            content: [{ type: "text" as const, text: "Error: recipient is required for type=message" }],
+            isError: true,
+          };
+        }
+        await appendInboxMessage(team_name, recipient, {
+          from: sender_name,
+          content: content ?? "",
+          summary: summary ?? "",
+          type: "message",
+        });
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify({ success: true, message: `Message sent to ${recipient}'s inbox`, routing: { sender: sender_name, target: `@${recipient}`, summary: summary ?? "" } }) }],
+        };
+
+      } else if (type === "broadcast") {
+        const config = await readTeamConfig(team_name);
+        let delivered = 0;
+        for (const member of config.members) {
+          if (member.name !== sender_name) {
+            await appendInboxMessage(team_name, member.name, {
+              from: sender_name,
+              content: content ?? "",
+              summary: summary ?? "",
+              type: "broadcast",
+            });
+            delivered++;
+          }
+        }
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify({ success: true, message: `Broadcast delivered to ${delivered} teammates`, routing: { sender: sender_name, target: "@all", summary: summary ?? "" } }) }],
+        };
+
+      } else if (type === "shutdown_request") {
+        if (!recipient) {
+          return {
+            content: [{ type: "text" as const, text: "Error: recipient is required for type=shutdown_request" }],
+            isError: true,
+          };
+        }
+        const reqId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        await appendInboxMessage(team_name, recipient, {
+          from: sender_name,
+          content: content ?? `Shutdown requested by ${sender_name}`,
+          summary: summary ?? `Shutdown request from ${sender_name}`,
+          type: "shutdown_request",
+          request_id: reqId,
+        });
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify({ success: true, message: `Shutdown request sent to ${recipient}`, request_id: reqId }) }],
+        };
+
+      } else if (type === "shutdown_response") {
+        if (!request_id) {
+          return {
+            content: [{ type: "text" as const, text: "Error: request_id is required for type=shutdown_response" }],
+            isError: true,
+          };
+        }
+        // Notify team-lead of shutdown decision
+        await appendInboxMessage(team_name, "team-lead", {
+          from: sender_name,
+          content: JSON.stringify({ type: "shutdown_response", request_id, approve: !!approve, content }),
+          summary: `${sender_name} ${approve ? "approved" : "rejected"} shutdown`,
+          type: "shutdown_response",
+          request_id,
+        });
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify({ success: true, message: `Shutdown response sent (approve=${approve})`, request_id }) }],
+        };
+
+      } else if (type === "plan_approval_response") {
+        if (!recipient || !request_id) {
+          return {
+            content: [{ type: "text" as const, text: "Error: recipient and request_id are required for type=plan_approval_response" }],
+            isError: true,
+          };
+        }
+        await appendInboxMessage(team_name, recipient, {
+          from: sender_name,
+          content: JSON.stringify({ type: "plan_approval_response", request_id, approve: !!approve, content }),
+          summary: `Plan ${approve ? "approved" : "rejected"} by ${sender_name}`,
+          type: "plan_approval_response",
+          request_id,
+        });
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify({ success: true, message: `Plan approval response sent to ${recipient} (approve=${approve})`, request_id }) }],
+        };
+      }
+
+      return {
+        content: [{ type: "text" as const, text: `Error: Unknown message type: ${type}` }],
+        isError: true,
+      };
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[task-external] SendMessage failed: ${msg}`);
+      return {
+        content: [{ type: "text" as const, text: `SendMessage failed: ${msg}` }],
+        isError: true,
+      };
+    }
+  },
+);
 
 // --- Start server ---
 async function main() {
