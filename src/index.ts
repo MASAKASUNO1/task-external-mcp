@@ -36,6 +36,14 @@ const MODE_TO_APPROVAL: Record<string, ApprovalMode> = {
 
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 
+// --- Config from environment variables ---
+const DEFAULT_MODEL = process.env.TASK_EXTERNAL_DEFAULT_MODEL ?? "gpt-5.3-codex";
+const MODEL_MAP: Record<string, string> = {
+  opus: process.env.TASK_EXTERNAL_MODEL_OPUS ?? "o3",
+  sonnet: process.env.TASK_EXTERNAL_MODEL_SONNET ?? "o4-mini",
+  haiku: process.env.TASK_EXTERNAL_MODEL_HAIKU ?? "codex-mini",
+};
+
 // --- Codex singleton ---
 const codex = new Codex();
 
@@ -161,15 +169,10 @@ server.tool(
         skipGitRepoCheck: true,
       };
 
-      // Map model enum to Codex model string
-      if (model) {
-        const MODEL_MAP: Record<string, string> = {
-          opus: "o3",
-          sonnet: "o4-mini",
-          haiku: "codex-mini",
-        };
-        threadOptions.model = MODEL_MAP[model] ?? model;
-      }
+      // Map model enum to Codex model string, or use default
+      threadOptions.model = model
+        ? (MODEL_MAP[model] ?? model)
+        : DEFAULT_MODEL;
 
       if (isolation === "worktree") {
         const { mkdtemp } = await import("node:fs/promises");
