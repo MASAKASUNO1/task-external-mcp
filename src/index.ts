@@ -518,7 +518,10 @@ Usage notes:
 - Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, web fetches, etc.), since it is not aware of the user's intent
 - If the agent description mentions that it should be used proactively, then you should try your best to use it without the user having to ask for it first. Use your judgement.
 - If the user specifies that they want you to run agents "in parallel", you MUST send a single message with multiple Task tool use content blocks. For example, if you need to launch both a build-validator agent and a test-runner agent in parallel, send a single message with both tool calls.
-- You can optionally set \`isolation: "worktree"\` to run the agent in a temporary git worktree, giving it an isolated copy of the repository. The worktree is automatically cleaned up if the agent makes no changes; if changes are made, the worktree path and branch are returned in the result.`;
+- You can optionally set \`isolation: "worktree"\` to run the agent in a temporary git worktree, giving it an isolated copy of the repository. The worktree is automatically cleaned up if the agent makes no changes; if changes are made, the worktree path and branch are returned in the result.
+
+IMPORTANT - Team mode (team_name parameter):
+When you specify team_name and name, the agent runs as a long-lived teammate in the background. However, this tool uses file-based inboxes with NO push notifications. You MUST call the CheckTeamInbox tool to receive messages from teammates. Without calling CheckTeamInbox, teammate outputs will never reach you. After spawning team agents, immediately call CheckTeamInbox(team_name=..., block=true) to wait for their results.`;
 
 // --- MCP Server setup ---
 const server = new McpServer({
@@ -705,7 +708,20 @@ server.tool(
           content: [
             {
               type: "text" as const,
-              text: `Spawned successfully.\nagent_id: ${agentName}@${team_name}\nname: ${agentName}\nteam_name: ${team_name}\nThe agent is now running and will receive instructions via mailbox.`,
+              text: [
+                `Spawned successfully.`,
+                `agent_id: ${agentName}@${team_name}`,
+                `name: ${agentName}`,
+                `team_name: ${team_name}`,
+                ``,
+                `IMPORTANT: This agent runs in the background but CANNOT send push notifications.`,
+                `You MUST call the CheckTeamInbox tool to receive messages from this agent.`,
+                `Recommended workflow:`,
+                `  1. Spawn all agents you need`,
+                `  2. Call CheckTeamInbox(team_name="${team_name}", block=true, timeout=120000) to wait for results`,
+                `  3. Process received messages and repeat CheckTeamInbox if more agents are still working`,
+                `Without calling CheckTeamInbox, you will never receive the agent's output.`,
+              ].join("\n"),
             },
           ],
         };
@@ -1201,11 +1217,30 @@ server.tool(
     return {
       content: [{
         type: "text" as const,
-        text: JSON.stringify({
-          team_name,
-          team_file_path: join(dir, "config.json"),
-          lead_agent_id: `team-lead@${team_name}`,
-        }, null, 2),
+        text: [
+          JSON.stringify({
+            team_name,
+            team_file_path: join(dir, "config.json"),
+            lead_agent_id: `team-lead@${team_name}`,
+          }, null, 2),
+          ``,
+          `Team "${team_name}" created successfully.`,
+          ``,
+          `=== HOW TEAM COMMUNICATION WORKS ===`,
+          `This MCP-based team uses file-based inboxes. There are NO push notifications.`,
+          `You (team-lead) MUST actively poll for messages using the CheckTeamInbox tool.`,
+          ``,
+          `Workflow:`,
+          `  1. TeamCreate (done)`,
+          `  2. Spawn agents with Task(team_name="${team_name}", name="agent-name", ...)`,
+          `  3. After spawning, call CheckTeamInbox(team_name="${team_name}", block=true) to WAIT for results`,
+          `  4. Process messages, send follow-ups with SendMessage if needed`,
+          `  5. Repeat CheckTeamInbox until all work is done`,
+          `  6. Shutdown agents with SendMessage(type="shutdown_request")`,
+          `  7. TeamDelete to clean up`,
+          ``,
+          `CRITICAL: If you do not call CheckTeamInbox, you will NEVER receive agent outputs.`,
+        ].join("\n"),
       }],
     };
   },
