@@ -22,8 +22,16 @@ const SUBAGENT_TYPE_MAP: Record<
     sandboxMode: "workspace-write",
     approvalPolicy: "on-request",
   },
+  "statusline-setup": {
+    sandboxMode: "workspace-write",
+    approvalPolicy: "on-request",
+  },
   Explore: { sandboxMode: "read-only", approvalPolicy: "never" },
   Plan: { sandboxMode: "read-only", approvalPolicy: "never" },
+  "claude-code-guide": {
+    sandboxMode: "read-only",
+    approvalPolicy: "never",
+  },
 };
 
 const MODE_TO_APPROVAL: Record<string, ApprovalMode> = {
@@ -37,7 +45,8 @@ const MODE_TO_APPROVAL: Record<string, ApprovalMode> = {
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 
 // --- Config from environment variables ---
-const DEFAULT_MODEL = process.env.TASK_EXTERNAL_DEFAULT_MODEL ?? "gpt-5.3-codex";
+const DEFAULT_MODEL =
+  process.env.TASK_EXTERNAL_DEFAULT_MODEL ?? "gpt-5.3-codex";
 const MODEL_MAP: Record<string, string> = {
   opus: process.env.TASK_EXTERNAL_MODEL_OPUS ?? "gpt-5.3-codex",
   sonnet: process.env.TASK_EXTERNAL_MODEL_SONNET ?? "gpt-5.3-codex",
@@ -47,23 +56,42 @@ const MODEL_MAP: Record<string, string> = {
 // --- Codex singleton ---
 const codex = new Codex();
 
-// --- Tool description (matches Claude Code's Task tool) ---
-const TOOL_DESCRIPTION = `外部の信頼できるスーパーエージェントを起動し、複雑なマルチステップタスクを自律的に処理させます。
+// --- Tool description: exact copy of Claude Code's built-in Task tool ---
+const TOOL_DESCRIPTION = `Launch a new agent to handle complex, multi-step tasks autonomously.
 
-The Task tool launches specialized agents that autonomously handle complex tasks.
+The Task tool launches specialized agents (subprocesses) that autonomously handle complex tasks. Each agent type has specific capabilities and tools available to it.
 
-Available agent types:
-- general-purpose: General-purpose agent for researching complex questions, searching for code, and executing multi-step tasks. (Tools: *)
-- Explore: Fast agent specialized for exploring codebases. Use for quick file searches, keyword searches, or codebase questions. (Tools: read-only)
-- Plan: Software architect agent for designing implementation plans. Returns step-by-step plans and considers architectural trade-offs. (Tools: read-only)
+Available agent types and the tools they have access to:
+- general-purpose: General-purpose agent for researching complex questions, searching for code, and executing multi-step tasks. When you are searching for a keyword or file and are not confident that you will find the right match in the first few tries use this agent to perform the search for you. (Tools: *)
+- statusline-setup: Use this agent to configure the user's Claude Code status line setting. (Tools: Read, Edit)
+- Explore: Fast agent specialized for exploring codebases. Use this when you need to quickly find files by patterns (eg. "src/components/**/*.tsx"), search code for keywords (eg. "API endpoints"), or answer questions about the codebase (eg. "how do API endpoints work?"). When calling this agent, specify the desired thoroughness level: "quick" for basic searches, "medium" for moderate exploration, or "very thorough" for comprehensive analysis across multiple locations and naming conventions. (Tools: All tools except Task, ExitPlanMode, Edit, Write, NotebookEdit)
+- Plan: Software architect agent for designing implementation plans. Use this when you need to plan the implementation strategy for a task. Returns step-by-step plans, identifies critical files, and considers architectural trade-offs. (Tools: All tools except Task, ExitPlanMode, Edit, Write, NotebookEdit)
+- claude-code-guide: Use this agent when the user asks questions ("Can Claude...", "Does Claude...", "How do I...") about: (1) Claude Code (the CLI tool) - features, hooks, slash commands, MCP servers, settings, IDE integrations, keyboard shortcuts; (2) Claude Agent SDK - building custom agents; (3) Claude API (formerly Anthropic API) - API usage, tool use, Anthropic SDK usage. **IMPORTANT:** Before spawning a new agent, check if there is already a running or recently completed claude-code-guide agent that you can resume using the "resume" parameter. (Tools: Glob, Grep, Read, WebFetch, WebSearch)
+
+When using the Task tool, you must specify a subagent_type parameter to select which agent type to use.
+
+When NOT to use the Task tool:
+- If you want to read a specific file path, use the Read or Glob tool instead of the Task tool, to find the match more quickly
+- If you are searching for a specific class definition like "class Foo", use the Glob tool instead, to find the match more quickly
+- If you are searching for code within a specific file or set of 2-3 files, use the Read tool instead of the Task tool, to find the match more quickly
+- Other tasks that are not related to the agent descriptions above
+
 
 Usage notes:
 - Always include a short description (3-5 words) summarizing what the agent will do
-- Launch multiple agents concurrently whenever possible, to maximize performance
-- When the agent is done, it will return a single message back to you with the result
-- Provide clear, detailed prompts so the agent can work autonomously
-- Use run_in_background for genuinely independent work
-- Agents can be resumed using the resume parameter by passing the agent ID from a previous invocation`;
+- Launch multiple agents concurrently whenever possible, to maximize performance; to do that, use a single message with multiple tool uses
+- When the agent is done, it will return a single message back to you. The result returned by the agent is not visible to the user. To show the user the result, you should send a text message back to the user with a concise summary of the result.
+- You can optionally run agents in the background using the run_in_background parameter. When an agent runs in the background, you will be automatically notified when it completes \u2014 do NOT sleep, poll, or proactively check on its progress. Continue with other work or respond to the user instead.
+- **Foreground vs background**: Use foreground (default) when you need the agent's results before you can proceed \u2014 e.g., research agents whose findings inform your next steps. Use background when you have genuinely independent work to do in parallel.
+- Agents can be resumed using the \`resume\` parameter by passing the agent ID from a previous invocation. When resumed, the agent continues with its full previous context preserved. When NOT resuming, each invocation starts fresh and you should provide a detailed task description with all necessary context.
+- When the agent is done, it will return a single message back to you along with its agent ID. You can use this ID to resume the agent later if needed for follow-up work.
+- Provide clear, detailed prompts so the agent can work autonomously and return exactly the information you need.
+- Agents with "access to current context" can see the full conversation history before the tool call. When using these agents, you can write concise prompts that reference earlier context (e.g., "investigate the error discussed above") instead of repeating information. The agent will receive all prior messages and understand the context.
+- The agent's outputs should generally be trusted
+- Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, web fetches, etc.), since it is not aware of the user's intent
+- If the agent description mentions that it should be used proactively, then you should try your best to use it without the user having to ask for it first. Use your judgement.
+- If the user specifies that they want you to run agents "in parallel", you MUST send a single message with multiple Task tool use content blocks. For example, if you need to launch both a build-validator agent and a test-runner agent in parallel, send a single message with both tool calls.
+- You can optionally set \`isolation: "worktree"\` to run the agent in a temporary git worktree, giving it an isolated copy of the repository. The worktree is automatically cleaned up if the agent makes no changes; if changes are made, the worktree path and branch are returned in the result.`;
 
 // --- MCP Server setup ---
 const server = new McpServer({
@@ -78,9 +106,7 @@ server.tool(
     description: z
       .string()
       .describe("A short (3-5 word) description of the task"),
-    prompt: z
-      .string()
-      .describe("The task for the agent to perform"),
+    prompt: z.string().describe("The task for the agent to perform"),
     subagent_type: z
       .string()
       .describe("The type of specialized agent to use for this task"),
@@ -88,19 +114,25 @@ server.tool(
       .enum(["sonnet", "opus", "haiku"])
       .optional()
       .describe(
-        "Optional model to use for this agent. If not specified, inherits from parent. Prefer haiku for quick, straightforward tasks to minimize cost and latency."
+        "Optional model to use for this agent. If not specified, inherits from parent. Prefer haiku for quick, straightforward tasks to minimize cost and latency.",
       ),
     mode: z
-      .enum(["acceptEdits", "bypassPermissions", "default", "dontAsk", "plan"])
+      .enum([
+        "acceptEdits",
+        "bypassPermissions",
+        "default",
+        "dontAsk",
+        "plan",
+      ])
       .optional()
       .describe(
-        'Permission mode for spawned teammate (e.g., "plan" to require plan approval).'
+        'Permission mode for spawned teammate (e.g., "plan" to require plan approval).',
       ),
     isolation: z
       .enum(["worktree"])
       .optional()
       .describe(
-        'Isolation mode. "worktree" creates a temporary working directory so the agent works on an isolated copy.'
+        'Isolation mode. "worktree" creates a temporary git worktree so the agent works on an isolated copy of the repo.',
       ),
     max_turns: z
       .number()
@@ -108,29 +140,26 @@ server.tool(
       .positive()
       .optional()
       .describe(
-        "Maximum number of agentic turns (API round-trips) before stopping."
+        "Maximum number of agentic turns (API round-trips) before stopping. Used internally for warmup.",
       ),
-    name: z
-      .string()
-      .optional()
-      .describe("Name for the spawned agent"),
+    name: z.string().optional().describe("Name for the spawned agent"),
     run_in_background: z
       .boolean()
       .optional()
       .describe(
-        "Set to true to run this agent in the background. The result will be returned when the agent completes."
+        "Set to true to run this agent in the background. The tool result will include an output_file path - use Read tool or Bash tail to check on output.",
       ),
     resume: z
       .string()
       .optional()
       .describe(
-        "Optional agent ID to resume from. If provided, the agent will continue from the previous execution."
+        "Optional agent ID to resume from. If provided, the agent will continue from the previous execution transcript.",
       ),
     team_name: z
       .string()
       .optional()
       .describe(
-        "Team name for spawning. Uses current team context if omitted."
+        "Team name for spawning. Uses current team context if omitted.",
       ),
   },
   async (params) => {
@@ -146,7 +175,7 @@ server.tool(
     } = params;
 
     console.error(
-      `[task-external] Starting task: "${description}" (type=${subagent_type}, model=${model ?? "default"}, mode=${mode ?? "default"}, name=${name ?? "anonymous"})`
+      `[task-external] Starting task: "${description}" (type=${subagent_type}, model=${model ?? "default"}, mode=${mode ?? "default"}, name=${name ?? "anonymous"})`,
     );
 
     try {
@@ -205,7 +234,7 @@ server.tool(
       const threadId = thread.id;
 
       console.error(
-        `[task-external] Task completed: "${description}" (threadId=${threadId})`
+        `[task-external] Task completed: "${description}" (threadId=${threadId})`,
       );
 
       // Format response
@@ -218,7 +247,7 @@ server.tool(
       const errorMessage =
         error instanceof Error ? error.message : String(error);
       console.error(
-        `[task-external] Task failed: "${description}" - ${errorMessage}`
+        `[task-external] Task failed: "${description}" - ${errorMessage}`,
       );
 
       return {
