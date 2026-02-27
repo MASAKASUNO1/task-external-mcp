@@ -1,0 +1,21 @@
+{
+  "name": "task-external",
+  "version": "1.0.0",
+  "type": "module",
+  "bin": {
+    "task-external": "./build/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node build/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "@openai/codex-sdk": "^0.106.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "@types/node": "^22.0.0"
+  }
+}
