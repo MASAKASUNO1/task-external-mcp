@@ -657,6 +657,8 @@ server.tool(
         sandboxMode,
         approvalPolicy,
         skipGitRepoCheck: true,
+        webSearchMode: "live",
+        webSearchEnabled: true,
       };
 
       // Model: パラメータ > エージェント定義 > デフォルト
