@@ -10,10 +10,14 @@ import {
   type RunResult,
   type ThreadItem,
 } from "@openai/codex-sdk";
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
+import { execFile as execFileCb } from "node:child_process";
+import { promisify } from "node:util";
 import { z } from "zod";
+
+const execFile = promisify(execFileCb);
 
 // --- Custom agent definition loader ---
 
@@ -79,6 +83,77 @@ function parseAgentFile(content: string, fallbackName: string): AgentDefinition 
     isolation: meta["isolation"],
     systemPrompt: body,
   };
+}
+
+// --- Git worktree helpers ---
+
+interface WorktreeInfo {
+  path: string;
+  branch: string;
+  originHead: string;
+}
+
+async function createWorktree(): Promise<WorktreeInfo> {
+  const timestamp = Date.now();
+  const branch = `task-external/${timestamp}`;
+  const worktreePath = join(tmpdir(), `task-external-wt-${timestamp}`);
+
+  await execFile("git", ["worktree", "add", worktreePath, "-b", branch]);
+  const { stdout: headSha } = await execFile("git", ["rev-parse", "HEAD"], {
+    cwd: worktreePath,
+  });
+
+  console.error(
+    `[task-external] Created git worktree: path=${worktreePath}, branch=${branch}`,
+  );
+
+  return { path: worktreePath, branch, originHead: headSha.trim() };
+}
+
+async function cleanupWorktree(wt: WorktreeInfo): Promise<{ hasChanges: boolean }> {
+  try {
+    const { stdout: status } = await execFile(
+      "git",
+      ["status", "--porcelain"],
+      { cwd: wt.path },
+    );
+    const { stdout: currentHead } = await execFile(
+      "git",
+      ["rev-parse", "HEAD"],
+      { cwd: wt.path },
+    );
+    const hasChanges =
+      status.trim().length > 0 || currentHead.trim() !== wt.originHead;
+
+    if (!hasChanges) {
+      await execFile("git", ["worktree", "remove", "--force", wt.path]);
+      try {
+        await execFile("git", ["branch", "-D", wt.branch]);
+      } catch {
+        // branch may already be deleted
+      }
+      console.error(
+        `[task-external] Worktree cleaned up (no changes): ${wt.path}`,
+      );
+    } else {
+      console.error(
+        `[task-external] Worktree retained (changes detected): ${wt.path} on branch ${wt.branch}`,
+      );
+    }
+
+    return { hasChanges };
+  } catch (err) {
+    console.error(
+      `[task-external] Error during worktree cleanup: ${err instanceof Error ? err.message : err}`,
+    );
+    // Force remove on error to prevent leaks
+    try {
+      await execFile("git", ["worktree", "remove", "--force", wt.path]);
+    } catch {
+      // best effort
+    }
+    return { hasChanges: false };
+  }
 }
 
 // --- Mapping tables ---
@@ -232,13 +307,21 @@ server.tool(
       model,
       mode,
       isolation,
+      max_turns,
       name,
+      run_in_background,
       resume,
+      team_name,
     } = params;
 
     console.error(
-      `[task-external] Starting task: "${description}" (type=${subagent_type}, model=${model ?? "default"}, mode=${mode ?? "default"}, name=${name ?? "anonymous"})`,
+      `[task-external] Starting task: "${description}" (type=${subagent_type}, model=${model ?? "default"}, mode=${mode ?? "default"}, name=${name ?? "anonymous"}, team=${team_name ?? "none"})`,
     );
+    if (max_turns != null) {
+      console.error(
+        `[task-external] max_turns=${max_turns} requested but Codex SDK does not support maxTurns — parameter accepted for compatibility`,
+      );
+    }
 
     // 1. 組み込み type を確認
     const builtinConfig = SUBAGENT_TYPE_MAP[subagent_type];
@@ -295,17 +378,6 @@ server.tool(
         threadOptions.model = DEFAULT_MODEL;
       }
 
-      const effectiveIsolation = isolation ?? agentDef?.isolation;
-      if (effectiveIsolation === "worktree") {
-        const { mkdtemp } = await import("node:fs/promises");
-        const { tmpdir } = await import("node:os");
-        const workDir = await mkdtemp(
-          join((await import("node:os")).tmpdir(), "task-external-"),
-        );
-        threadOptions.workingDirectory = workDir;
-        console.error(`[task-external] Worktree isolation: ${workDir}`);
-      }
-
       // プロンプト構築: カスタムエージェントの場合は system prompt を先頭に注入
       let finalPrompt = prompt;
       if (agentDef) {
@@ -313,37 +385,159 @@ server.tool(
           `<system>\n${agentDef.systemPrompt}\n</system>\n\n${prompt}`;
       }
 
-      // Create or resume thread
-      const thread = resume
-        ? codex.resumeThread(resume, threadOptions)
-        : codex.startThread(threadOptions);
+      const effectiveIsolation = isolation ?? agentDef?.isolation;
 
-      // Run with timeout
-      const controller = new AbortController();
-      const timeout = setTimeout(
-        () => controller.abort(),
-        DEFAULT_TIMEOUT_MS,
-      );
+      // --- Background execution path ---
+      if (run_in_background) {
+        const outputFile = join(
+          tmpdir(),
+          `task-external-bg-${Date.now()}.json`,
+        );
 
-      let turn: RunResult;
-      try {
-        turn = await thread.run(finalPrompt, { signal: controller.signal });
-      } finally {
-        clearTimeout(timeout);
+        // Fire-and-forget: launch async, return immediately
+        (async () => {
+          let worktree: WorktreeInfo | null = null;
+          try {
+            if (effectiveIsolation === "worktree") {
+              worktree = await createWorktree();
+              threadOptions.workingDirectory = worktree.path;
+            }
+
+            const thread = resume
+              ? codex.resumeThread(resume, threadOptions)
+              : codex.startThread(threadOptions);
+
+            const controller = new AbortController();
+            const timeoutHandle = setTimeout(
+              () => controller.abort(),
+              DEFAULT_TIMEOUT_MS,
+            );
+
+            let turn: RunResult;
+            try {
+              turn = await thread.run(finalPrompt, {
+                signal: controller.signal,
+              });
+            } finally {
+              clearTimeout(timeoutHandle);
+            }
+
+            let worktreePath: string | undefined;
+            let worktreeBranch: string | undefined;
+            if (worktree) {
+              const { hasChanges } = await cleanupWorktree(worktree);
+              if (hasChanges) {
+                worktreePath = worktree.path;
+                worktreeBranch = worktree.branch;
+              }
+            }
+
+            const result = formatTurnResult(turn, {
+              threadId: thread.id,
+              worktreePath,
+              worktreeBranch,
+              name,
+              teamName: team_name,
+            });
+
+            await writeFile(
+              outputFile,
+              JSON.stringify({ status: "completed", result }, null, 2),
+            );
+            console.error(
+              `[task-external] Background task completed: "${description}" → ${outputFile}`,
+            );
+          } catch (bgError: unknown) {
+            if (worktree) {
+              await cleanupWorktree(worktree);
+            }
+            const msg =
+              bgError instanceof Error ? bgError.message : String(bgError);
+            await writeFile(
+              outputFile,
+              JSON.stringify({ status: "error", error: msg }, null, 2),
+            ).catch(() => {});
+            console.error(
+              `[task-external] Background task failed: "${description}" - ${msg}`,
+            );
+          }
+        })();
+
+        console.error(
+          `[task-external] Background task launched: "${description}" → ${outputFile}`,
+        );
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Task "${description}" launched in background.\n[output_file: ${outputFile}]`,
+            },
+          ],
+        };
       }
 
-      const threadId = thread.id;
+      // --- Foreground execution path ---
+      let worktree: WorktreeInfo | null = null;
+      if (effectiveIsolation === "worktree") {
+        worktree = await createWorktree();
+        threadOptions.workingDirectory = worktree.path;
+      }
 
-      console.error(
-        `[task-external] Task completed: "${description}" (threadId=${threadId})`,
-      );
+      try {
+        const thread = resume
+          ? codex.resumeThread(resume, threadOptions)
+          : codex.startThread(threadOptions);
 
-      // Format response
-      const responseText = formatTurnResult(turn, threadId);
+        const controller = new AbortController();
+        const timeoutHandle = setTimeout(
+          () => controller.abort(),
+          DEFAULT_TIMEOUT_MS,
+        );
 
-      return {
-        content: [{ type: "text" as const, text: responseText }],
-      };
+        let turn: RunResult;
+        try {
+          turn = await thread.run(finalPrompt, { signal: controller.signal });
+        } finally {
+          clearTimeout(timeoutHandle);
+        }
+
+        const threadId = thread.id;
+
+        console.error(
+          `[task-external] Task completed: "${description}" (threadId=${threadId})`,
+        );
+
+        // Worktree cleanup: check for changes
+        let worktreePath: string | undefined;
+        let worktreeBranch: string | undefined;
+        if (worktree) {
+          const { hasChanges } = await cleanupWorktree(worktree);
+          if (hasChanges) {
+            worktreePath = worktree.path;
+            worktreeBranch = worktree.branch;
+          }
+        }
+
+        // Format response
+        const responseText = formatTurnResult(turn, {
+          threadId,
+          worktreePath,
+          worktreeBranch,
+          name,
+          teamName: team_name,
+        });
+
+        return {
+          content: [{ type: "text" as const, text: responseText }],
+        };
+      } catch (innerError) {
+        // Ensure worktree is cleaned up even on Codex execution failure
+        if (worktree) {
+          await cleanupWorktree(worktree);
+        }
+        throw innerError;
+      }
     } catch (error: unknown) {
       const errorMessage =
         error instanceof Error ? error.message : String(error);
@@ -364,7 +558,15 @@ server.tool(
   },
 );
 
-function formatTurnResult(turn: RunResult, threadId: string | null): string {
+interface FormatOptions {
+  threadId: string | null;
+  worktreePath?: string;
+  worktreeBranch?: string;
+  name?: string;
+  teamName?: string;
+}
+
+function formatTurnResult(turn: RunResult, options: FormatOptions): string {
   const parts: string[] = [];
 
   if (turn.finalResponse) {
@@ -385,8 +587,19 @@ function formatTurnResult(turn: RunResult, threadId: string | null): string {
     parts.push(`[Commands executed: ${commands.length}]`);
   }
 
-  if (threadId) {
-    parts.push(`\n[agentId: ${threadId}]`);
+  if (options.worktreePath && options.worktreeBranch) {
+    parts.push(`\n[worktree_path: ${options.worktreePath}]`);
+    parts.push(`[worktree_branch: ${options.worktreeBranch}]`);
+  }
+
+  if (options.threadId) {
+    parts.push(`\n[agentId: ${options.threadId}]`);
+  }
+  if (options.name) {
+    parts.push(`[agent_name: ${options.name}]`);
+  }
+  if (options.teamName) {
+    parts.push(`[team_name: ${options.teamName}]`);
   }
 
   if (turn.usage) {
