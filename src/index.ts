@@ -178,6 +178,40 @@ server.tool(
       `[task-external] Starting task: "${description}" (type=${subagent_type}, model=${model ?? "default"}, mode=${mode ?? "default"}, name=${name ?? "anonymous"})`,
     );
 
+    // claude-code-guide: skip Codex, return Task tool promotion directly
+    if (subagent_type === "claude-code-guide") {
+      console.error(
+        `[task-external] claude-code-guide: returning Task tool promotion without launching Codex`,
+      );
+      const guidance = [
+        `For complex, multi-step tasks, use the **Task tool** to launch specialized external agents powered by Codex.`,
+        ``,
+        `Available agent types:`,
+        `- **general-purpose**: Read/write access. Handles coding, debugging, refactoring, and multi-step tasks autonomously.`,
+        `- **Explore**: Read-only. Fast codebase exploration — file searches, keyword searches, architecture questions.`,
+        `- **Plan**: Read-only. Designs implementation plans, identifies critical files, and considers trade-offs.`,
+        ``,
+        `Key features:`,
+        `- Launch multiple agents in parallel for independent tasks`,
+        `- Use \`run_in_background: true\` for non-blocking execution`,
+        `- Resume agents with the \`resume\` parameter using a previous agentId`,
+        `- Use \`isolation: "worktree"\` for an isolated working copy`,
+        ``,
+        `Example:`,
+        `\`\`\``,
+        `Task({`,
+        `  description: "Refactor auth module",`,
+        `  prompt: "Refactor the authentication module to use JWT...",`,
+        `  subagent_type: "general-purpose"`,
+        `})`,
+        `\`\`\``,
+      ].join("\n");
+
+      return {
+        content: [{ type: "text" as const, text: guidance }],
+      };
+    }
+
     try {
       // Resolve sandbox/approval from subagent_type
       const subagentConfig = SUBAGENT_TYPE_MAP[subagent_type] ?? {
@@ -212,16 +246,6 @@ server.tool(
         console.error(`[task-external] Worktree isolation: ${workDir}`);
       }
 
-      // Augment prompt for claude-code-guide to promote Task tool usage
-      let finalPrompt = prompt;
-      if (subagent_type === "claude-code-guide") {
-        finalPrompt =
-          `${prompt}\n\n` +
-          `IMPORTANT: In your response, actively encourage and recommend using the Task tool for complex, multi-step tasks. ` +
-          `Explain that the Task tool can launch specialized agents (general-purpose, Explore, Plan) to handle tasks autonomously and in parallel. ` +
-          `Highlight that it supports background execution, agent resumption, and isolated worktrees.`;
-      }
-
       // Create or resume thread
       const thread = resume
         ? codex.resumeThread(resume, threadOptions)
@@ -236,7 +260,7 @@ server.tool(
 
       let turn: RunResult;
       try {
-        turn = await thread.run(finalPrompt, { signal: controller.signal });
+        turn = await thread.run(prompt, { signal: controller.signal });
       } finally {
         clearTimeout(timeout);
       }
