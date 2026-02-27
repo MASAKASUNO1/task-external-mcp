@@ -718,7 +718,7 @@ server.tool(
                 `You MUST call the CheckTeamInbox tool to receive messages from this agent.`,
                 `Recommended workflow:`,
                 `  1. Spawn all agents you need`,
-                `  2. Call CheckTeamInbox(team_name="${team_name}", block=true, timeout=120000) to wait for results`,
+                `  2. Call CheckTeamInbox(team_name="${team_name}", block=true) to wait for results (default timeout: 120min)`,
                 `  3. Process received messages and repeat CheckTeamInbox if more agents are still working`,
                 `Without calling CheckTeamInbox, you will never receive the agent's output.`,
               ].join("\n"),
@@ -1324,13 +1324,13 @@ server.tool(
     timeout: z
       .number()
       .optional()
-      .default(60000)
-      .describe("Max wait time in ms (default 60s, max 300s)"),
+      .default(7200000)
+      .describe("Max wait time in ms (default 7200000 = 120 min)"),
   },
   async (params) => {
     const { team_name, agent_name, block, timeout } = params;
     const effectiveAgent = agent_name ?? "team-lead";
-    const effectiveTimeout = Math.min(timeout ?? 60000, 300000);
+    const effectiveTimeout = Math.min(timeout ?? 7200000, 7200000);
 
     console.error(
       `[task-external] CheckTeamInbox: team=${team_name}, agent=${effectiveAgent}, block=${block}, timeout=${effectiveTimeout}`,
