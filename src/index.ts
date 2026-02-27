@@ -337,7 +337,7 @@ async function pollInbox(
   agentName: string,
   signal?: AbortSignal,
 ): Promise<InboxMessage[]> {
-  const MAX_POLLS = 150; // 150 * 2s = 300s
+  const MAX_POLLS = 3600; // 3600 * 2s = 7200s = 120min
   for (let i = 0; i < MAX_POLLS; i++) {
     if (signal?.aborted) return [];
     const msgs = await drainInbox(teamName, agentName);
@@ -1131,7 +1131,18 @@ server.tool(
           request_id: reqId,
         });
         return {
-          content: [{ type: "text" as const, text: JSON.stringify({ success: true, message: `Shutdown request sent to ${recipient}`, request_id: reqId }) }],
+          content: [{
+            type: "text" as const,
+            text: [
+              JSON.stringify({ success: true, message: `Shutdown request sent to ${recipient}`, request_id: reqId }),
+              ``,
+              `Shutdown request delivered to ${recipient}'s inbox.`,
+              `The agent will process it on its next poll cycle (up to 2s).`,
+              `To confirm shutdown completed, call CheckTeamInbox(team_name="${team_name}", block=true)`,
+              `and wait for a shutdown_approved message from ${recipient}.`,
+              `Only after receiving shutdown_approved should you call TeamDelete.`,
+            ].join("\n"),
+          }],
         };
 
       } else if (type === "shutdown_response") {
