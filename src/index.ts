@@ -14,6 +14,7 @@ import { z } from "zod";
 
 // --- Mapping tables ---
 
+// Codex で処理する subagent_type のみ定義。ここにないものはネイティブ Task にリダイレクトする。
 const SUBAGENT_TYPE_MAP: Record<
   string,
   { sandboxMode: SandboxMode; approvalPolicy: ApprovalMode }
@@ -22,16 +23,8 @@ const SUBAGENT_TYPE_MAP: Record<
     sandboxMode: "workspace-write",
     approvalPolicy: "on-request",
   },
-  "statusline-setup": {
-    sandboxMode: "workspace-write",
-    approvalPolicy: "on-request",
-  },
   Explore: { sandboxMode: "read-only", approvalPolicy: "never" },
   Plan: { sandboxMode: "read-only", approvalPolicy: "never" },
-  "claude-code-guide": {
-    sandboxMode: "read-only",
-    approvalPolicy: "never",
-  },
 };
 
 const MODE_TO_APPROVAL: Record<string, ApprovalMode> = {
@@ -178,19 +171,15 @@ server.tool(
       `[task-external] Starting task: "${description}" (type=${subagent_type}, model=${model ?? "default"}, mode=${mode ?? "default"}, name=${name ?? "anonymous"})`,
     );
 
-    // claude-code-guide: skip Codex, return Task tool promotion directly
-    if (subagent_type === "claude-code-guide") {
+    // SUBAGENT_TYPE_MAP にない type はネイティブ Task にリダイレクト
+    const subagentConfig = SUBAGENT_TYPE_MAP[subagent_type];
+    if (!subagentConfig) {
       return {
-        content: [{ type: "text" as const, text: "Taskツールで claude-code-guide を起動してください。" }],
+        content: [{ type: "text" as const, text: `Taskツールで ${subagent_type} を起動してください。` }],
       };
     }
 
     try {
-      // Resolve sandbox/approval from subagent_type
-      const subagentConfig = SUBAGENT_TYPE_MAP[subagent_type] ?? {
-        sandboxMode: "workspace-write" as SandboxMode,
-        approvalPolicy: "on-request" as ApprovalMode,
-      };
 
       // Mode override for approval policy
       const approvalPolicy: ApprovalMode =
