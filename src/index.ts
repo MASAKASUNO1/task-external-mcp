@@ -1316,10 +1316,10 @@ server.tool(
   "CheckTeamInbox",
   `Check your inbox for messages from teammates. Use this to receive results, idle notifications, and status updates from team agents.
 
-- Call with block=true to wait for new messages (up to timeout ms)
+- Call with block=true to wait for new messages (waits up to 120 minutes)
 - Call with block=false to check immediately and return
 - Returns all unread messages from teammates
-- After spawning team agents, call this periodically to get their updates`,
+- After spawning team agents, call this to get their updates`,
   {
     team_name: z.string().describe("Team name"),
     agent_name: z
@@ -1331,20 +1331,15 @@ server.tool(
       .boolean()
       .optional()
       .default(true)
-      .describe("Whether to wait for new messages"),
-    timeout: z
-      .number()
-      .optional()
-      .default(7200000)
-      .describe("Max wait time in ms (default 7200000 = 120 min)"),
+      .describe("Whether to wait for new messages (timeout is fixed at 120 minutes)"),
   },
   async (params) => {
-    const { team_name, agent_name, block, timeout } = params;
+    const { team_name, agent_name, block } = params;
     const effectiveAgent = agent_name ?? "team-lead";
-    const effectiveTimeout = Math.min(timeout ?? 7200000, 7200000);
+    const INBOX_TIMEOUT_MS = 7200000; // 120 minutes, fixed
 
     console.error(
-      `[task-external] CheckTeamInbox: team=${team_name}, agent=${effectiveAgent}, block=${block}, timeout=${effectiveTimeout}`,
+      `[task-external] CheckTeamInbox: team=${team_name}, agent=${effectiveAgent}, block=${block}`,
     );
 
     if (!block) {
@@ -1366,8 +1361,8 @@ server.tool(
       };
     }
 
-    // Blocking: poll until messages arrive or timeout
-    const deadline = Date.now() + effectiveTimeout;
+    // Blocking: poll until messages arrive or timeout (120 min fixed)
+    const deadline = Date.now() + INBOX_TIMEOUT_MS;
     while (Date.now() < deadline) {
       const msgs = await drainInbox(team_name, effectiveAgent);
       if (msgs.length > 0) {
@@ -1384,7 +1379,7 @@ server.tool(
     return {
       content: [{
         type: "text" as const,
-        text: `No messages received after ${effectiveTimeout}ms.`,
+        text: `No messages received after 120 minutes.`,
       }],
     };
   },
