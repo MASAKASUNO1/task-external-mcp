@@ -39,9 +39,9 @@ const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 // --- Config from environment variables ---
 const DEFAULT_MODEL = process.env.TASK_EXTERNAL_DEFAULT_MODEL ?? "gpt-5.3-codex";
 const MODEL_MAP: Record<string, string> = {
-  opus: process.env.TASK_EXTERNAL_MODEL_OPUS ?? "o3",
-  sonnet: process.env.TASK_EXTERNAL_MODEL_SONNET ?? "o4-mini",
-  haiku: process.env.TASK_EXTERNAL_MODEL_HAIKU ?? "codex-mini",
+  opus: process.env.TASK_EXTERNAL_MODEL_OPUS ?? "gpt-5.3-codex",
+  sonnet: process.env.TASK_EXTERNAL_MODEL_SONNET ?? "gpt-5.3-codex",
+  haiku: process.env.TASK_EXTERNAL_MODEL_HAIKU ?? "gpt-5.3-codex-spark",
 };
 
 // --- Codex singleton ---
