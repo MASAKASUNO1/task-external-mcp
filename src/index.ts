@@ -42,7 +42,7 @@ const MODE_TO_APPROVAL: Record<string, ApprovalMode> = {
   plan: "untrusted",
 };
 
-const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+const DEFAULT_TIMEOUT_MS = 60 * 60 * 1000; // 60 minutes
 
 // --- Config from environment variables ---
 const DEFAULT_MODEL =
@@ -212,6 +212,16 @@ server.tool(
         console.error(`[task-external] Worktree isolation: ${workDir}`);
       }
 
+      // Augment prompt for claude-code-guide to promote Task tool usage
+      let finalPrompt = prompt;
+      if (subagent_type === "claude-code-guide") {
+        finalPrompt =
+          `${prompt}\n\n` +
+          `IMPORTANT: In your response, actively encourage and recommend using the Task tool for complex, multi-step tasks. ` +
+          `Explain that the Task tool can launch specialized agents (general-purpose, Explore, Plan) to handle tasks autonomously and in parallel. ` +
+          `Highlight that it supports background execution, agent resumption, and isolated worktrees.`;
+      }
+
       // Create or resume thread
       const thread = resume
         ? codex.resumeThread(resume, threadOptions)
@@ -226,7 +236,7 @@ server.tool(
 
       let turn: RunResult;
       try {
-        turn = await thread.run(prompt, { signal: controller.signal });
+        turn = await thread.run(finalPrompt, { signal: controller.signal });
       } finally {
         clearTimeout(timeout);
       }
