@@ -1169,6 +1169,192 @@ server.tool(
   },
 );
 
+// --- TeamCreate tool ---
+// Creates team directory structure so teammates can coordinate.
+
+server.tool(
+  "TeamCreate",
+  "Create a new team to coordinate multiple agents. Creates team config and task directories.",
+  {
+    team_name: z.string().describe("Name for the new team"),
+    description: z.string().optional().describe("Team description/purpose"),
+  },
+  async (params) => {
+    const { team_name, description } = params;
+
+    console.error(`[task-external] TeamCreate: ${team_name}`);
+
+    const dir = teamDir(team_name);
+    await mkdir(dir, { recursive: true });
+    await mkdir(join(dir, "inboxes", "team-lead"), { recursive: true });
+    await mkdir(tasksDir(team_name), { recursive: true });
+
+    const config: TeamConfig = {
+      team_name,
+      description,
+      members: [{ name: "team-lead", agentId: `team-lead@${team_name}`, agentType: "leader" }],
+    };
+    await writeTeamConfig(team_name, config);
+
+    return {
+      content: [{
+        type: "text" as const,
+        text: JSON.stringify({
+          team_name,
+          team_file_path: join(dir, "config.json"),
+          lead_agent_id: `team-lead@${team_name}`,
+        }, null, 2),
+      }],
+    };
+  },
+);
+
+// --- TeamDelete tool ---
+
+server.tool(
+  "TeamDelete",
+  "Remove team and task directories when the swarm work is complete.",
+  {
+    team_name: z.string().describe("Team name to delete"),
+  },
+  async (params) => {
+    const { team_name } = params;
+
+    console.error(`[task-external] TeamDelete: ${team_name}`);
+
+    const config = await readTeamConfig(team_name);
+    const activeMembers = config.members.filter((m) => m.name !== "team-lead");
+    if (activeMembers.length > 0) {
+      return {
+        content: [{
+          type: "text" as const,
+          text: JSON.stringify({
+            success: false,
+            message: `Cannot cleanup team with ${activeMembers.length} active member(s): ${activeMembers.map((m) => m.name).join(", ")}. Use SendMessage with type=shutdown_request to gracefully terminate teammates first.`,
+            team_name,
+          }, null, 2),
+        }],
+      };
+    }
+
+    // Best-effort cleanup
+    const { rm } = await import("node:fs/promises");
+    try {
+      await rm(teamDir(team_name), { recursive: true, force: true });
+    } catch { /* best effort */ }
+    try {
+      await rm(tasksDir(team_name), { recursive: true, force: true });
+    } catch { /* best effort */ }
+
+    return {
+      content: [{
+        type: "text" as const,
+        text: JSON.stringify({
+          success: true,
+          message: `Cleaned up directories for team "${team_name}"`,
+          team_name,
+        }, null, 2),
+      }],
+    };
+  },
+);
+
+// --- CheckTeamInbox tool ---
+// Allows the team-lead (Claude Code) to receive messages from teammates.
+// This is the critical missing piece: without this, the team-lead has
+// no way to see teammate outputs, idle notifications, or shutdown responses.
+
+server.tool(
+  "CheckTeamInbox",
+  `Check your inbox for messages from teammates. Use this to receive results, idle notifications, and status updates from team agents.
+
+- Call with block=true to wait for new messages (up to timeout ms)
+- Call with block=false to check immediately and return
+- Returns all unread messages from teammates
+- After spawning team agents, call this periodically to get their updates`,
+  {
+    team_name: z.string().describe("Team name"),
+    agent_name: z
+      .string()
+      .optional()
+      .default("team-lead")
+      .describe("Your agent name (defaults to team-lead)"),
+    block: z
+      .boolean()
+      .optional()
+      .default(true)
+      .describe("Whether to wait for new messages"),
+    timeout: z
+      .number()
+      .optional()
+      .default(60000)
+      .describe("Max wait time in ms (default 60s, max 300s)"),
+  },
+  async (params) => {
+    const { team_name, agent_name, block, timeout } = params;
+    const effectiveAgent = agent_name ?? "team-lead";
+    const effectiveTimeout = Math.min(timeout ?? 60000, 300000);
+
+    console.error(
+      `[task-external] CheckTeamInbox: team=${team_name}, agent=${effectiveAgent}, block=${block}, timeout=${effectiveTimeout}`,
+    );
+
+    if (!block) {
+      // Non-blocking: return immediately
+      const msgs = await drainInbox(team_name, effectiveAgent);
+      if (msgs.length === 0) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: "No new messages.",
+          }],
+        };
+      }
+      return {
+        content: [{
+          type: "text" as const,
+          text: formatInboxMessages(msgs),
+        }],
+      };
+    }
+
+    // Blocking: poll until messages arrive or timeout
+    const deadline = Date.now() + effectiveTimeout;
+    while (Date.now() < deadline) {
+      const msgs = await drainInbox(team_name, effectiveAgent);
+      if (msgs.length > 0) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: formatInboxMessages(msgs),
+          }],
+        };
+      }
+      await sleep(2000);
+    }
+
+    return {
+      content: [{
+        type: "text" as const,
+        text: `No messages received after ${effectiveTimeout}ms.`,
+      }],
+    };
+  },
+);
+
+function formatInboxMessages(msgs: InboxMessage[]): string {
+  const parts: string[] = [];
+  for (const m of msgs) {
+    const header = `[From: ${m.from}] [Type: ${m.type ?? "message"}] [${m.timestamp}]`;
+    if (m.summary) {
+      parts.push(`${header}\nSummary: ${m.summary}\n${m.content}`);
+    } else {
+      parts.push(`${header}\n${m.content}`);
+    }
+  }
+  return parts.join("\n\n---\n\n");
+}
+
 // --- Start server ---
 async function main() {
   const transport = new StdioServerTransport();
