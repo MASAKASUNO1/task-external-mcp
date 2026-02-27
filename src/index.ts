@@ -10,11 +10,80 @@ import {
   type RunResult,
   type ThreadItem,
 } from "@openai/codex-sdk";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
+import { homedir } from "node:os";
 import { z } from "zod";
+
+// --- Custom agent definition loader ---
+
+interface AgentDefinition {
+  name: string;
+  description?: string;
+  tools?: string;
+  model?: string;
+  permissionMode?: string;
+  maxTurns?: number;
+  isolation?: string;
+  systemPrompt: string; // markdown body
+}
+
+/**
+ * .claude/agents/{name}.md を探して読み込む。
+ * 探索順: プロジェクト (.claude/agents/) → ユーザー (~/.claude/agents/)
+ */
+async function loadAgentDefinition(
+  name: string,
+): Promise<AgentDefinition | null> {
+  const candidates = [
+    join(process.cwd(), ".claude", "agents", `${name}.md`),
+    join(homedir(), ".claude", "agents", `${name}.md`),
+  ];
+
+  for (const filePath of candidates) {
+    try {
+      const content = await readFile(filePath, "utf-8");
+      return parseAgentFile(content, name);
+    } catch {
+      // file not found, try next
+    }
+  }
+  return null;
+}
+
+function parseAgentFile(content: string, fallbackName: string): AgentDefinition {
+  const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
+  if (!frontmatterMatch) {
+    return { name: fallbackName, systemPrompt: content.trim() };
+  }
+
+  const yamlBlock = frontmatterMatch[1]!;
+  const body = frontmatterMatch[2]!.trim();
+
+  // Simple YAML key-value parser (no nested objects)
+  const meta: Record<string, string> = {};
+  for (const line of yamlBlock.split("\n")) {
+    const match = line.match(/^(\w+)\s*:\s*(.+)$/);
+    if (match) {
+      meta[match[1]!] = match[2]!.trim();
+    }
+  }
+
+  return {
+    name: meta["name"] ?? fallbackName,
+    description: meta["description"],
+    tools: meta["tools"],
+    model: meta["model"],
+    permissionMode: meta["permissionMode"],
+    maxTurns: meta["maxTurns"] ? Number(meta["maxTurns"]) : undefined,
+    isolation: meta["isolation"],
+    systemPrompt: body,
+  };
+}
 
 // --- Mapping tables ---
 
-// Codex で処理する subagent_type のみ定義。ここにないものはネイティブ Task にリダイレクトする。
+// Codex で直接処理する組み込み subagent_type。
 const SUBAGENT_TYPE_MAP: Record<
   string,
   { sandboxMode: SandboxMode; approvalPolicy: ApprovalMode }
@@ -171,41 +240,77 @@ server.tool(
       `[task-external] Starting task: "${description}" (type=${subagent_type}, model=${model ?? "default"}, mode=${mode ?? "default"}, name=${name ?? "anonymous"})`,
     );
 
-    // SUBAGENT_TYPE_MAP にない type はネイティブ Task にリダイレクト
-    const subagentConfig = SUBAGENT_TYPE_MAP[subagent_type];
-    if (!subagentConfig) {
-      return {
-        content: [{ type: "text" as const, text: `Taskツールで ${subagent_type} を起動してください。` }],
-      };
+    // 1. 組み込み type を確認
+    const builtinConfig = SUBAGENT_TYPE_MAP[subagent_type];
+
+    // 2. 組み込みにない場合、カスタムエージェント定義を探す
+    let agentDef: AgentDefinition | null = null;
+    if (!builtinConfig) {
+      agentDef = await loadAgentDefinition(subagent_type);
+      if (!agentDef) {
+        // どちらにもない → ネイティブ Task にリダイレクト
+        return {
+          content: [{ type: "text" as const, text: `Taskツールで ${subagent_type} を起動してください。` }],
+        };
+      }
+      console.error(
+        `[task-external] Loaded custom agent definition: ${subagent_type}`,
+      );
     }
 
     try {
+      // sandbox/approval を決定
+      let sandboxMode: SandboxMode;
+      let baseApproval: ApprovalMode;
+
+      if (builtinConfig) {
+        sandboxMode = builtinConfig.sandboxMode;
+        baseApproval = builtinConfig.approvalPolicy;
+      } else {
+        // カスタムエージェント: permissionMode から推定、デフォルトは general-purpose 相当
+        const permMode = agentDef!.permissionMode ?? mode ?? "default";
+        sandboxMode = "workspace-write";
+        baseApproval = MODE_TO_APPROVAL[permMode] ?? "on-request";
+      }
 
       // Mode override for approval policy
       const approvalPolicy: ApprovalMode =
         mode && MODE_TO_APPROVAL[mode]
           ? MODE_TO_APPROVAL[mode]!
-          : subagentConfig.approvalPolicy;
+          : baseApproval;
 
       // Build thread options
       const threadOptions: ThreadOptions = {
-        sandboxMode: subagentConfig.sandboxMode,
+        sandboxMode,
         approvalPolicy,
         skipGitRepoCheck: true,
       };
 
-      // Map model enum to Codex model string, or use default
-      threadOptions.model = model
-        ? (MODEL_MAP[model] ?? model)
-        : DEFAULT_MODEL;
+      // Model: パラメータ > エージェント定義 > デフォルト
+      if (model) {
+        threadOptions.model = MODEL_MAP[model] ?? model;
+      } else if (agentDef?.model && MODEL_MAP[agentDef.model]) {
+        threadOptions.model = MODEL_MAP[agentDef.model]!;
+      } else {
+        threadOptions.model = DEFAULT_MODEL;
+      }
 
-      if (isolation === "worktree") {
+      const effectiveIsolation = isolation ?? agentDef?.isolation;
+      if (effectiveIsolation === "worktree") {
         const { mkdtemp } = await import("node:fs/promises");
         const { tmpdir } = await import("node:os");
-        const { join } = await import("node:path");
-        const workDir = await mkdtemp(join(tmpdir(), "task-external-"));
+        const workDir = await mkdtemp(
+          join((await import("node:os")).tmpdir(), "task-external-"),
+        );
         threadOptions.workingDirectory = workDir;
         console.error(`[task-external] Worktree isolation: ${workDir}`);
+      }
+
+      // プロンプト構築: カスタムエージェントの場合は system prompt を先頭に注入
+      let finalPrompt = prompt;
+      if (agentDef) {
+        finalPrompt =
+          `<system>\n${agentDef.systemPrompt}\n</system>\n\n${prompt}`;
       }
 
       // Create or resume thread
@@ -222,7 +327,7 @@ server.tool(
 
       let turn: RunResult;
       try {
-        turn = await thread.run(prompt, { signal: controller.signal });
+        turn = await thread.run(finalPrompt, { signal: controller.signal });
       } finally {
         clearTimeout(timeout);
       }
