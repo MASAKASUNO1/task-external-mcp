@@ -710,11 +710,24 @@ server.tool(
       }
 
       // --- Background execution path ---
+      // Mimics native Claude Code background tasks:
+      //   1. Return immediately with task_id + output_file
+      //   2. Write result to output_file on completion
+      //   3. Send notification via server.notification() to trigger
+      //      the main agent's next turn (closest MCP equivalent of
+      //      Claude Code's queue-operation enqueue mechanism)
       if (run_in_background) {
+        const taskId = `bg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
         const outputFile = join(
           tmpdir(),
-          `task-external-bg-${Date.now()}.json`,
+          `task-external-bg-${taskId}.json`,
         );
+
+        // Write initial status so Read can detect "running" state
+        writeFile(
+          outputFile,
+          JSON.stringify({ status: "running", task_id: taskId, description }, null, 2),
+        ).catch(() => {});
 
         // Fire-and-forget: launch async, return immediately
         (async () => {
@@ -764,11 +777,35 @@ server.tool(
 
             await writeFile(
               outputFile,
-              JSON.stringify({ status: "completed", result }, null, 2),
+              JSON.stringify({
+                status: "completed",
+                task_id: taskId,
+                description,
+                result,
+                threadId: thread.id,
+                worktreePath,
+                worktreeBranch,
+              }, null, 2),
             );
+
             console.error(
               `[task-external] Background task completed: "${description}" → ${outputFile}`,
             );
+
+            // Send MCP notification to trigger the main agent's next turn.
+            // This is the closest equivalent to Claude Code's native
+            // queue-operation enqueue → <task-notification> mechanism.
+            try {
+              await server.server.notification({
+                method: "notifications/resources/updated",
+                params: {
+                  uri: `task://${taskId}`,
+                  description: `Background task "${description}" completed`,
+                },
+              });
+            } catch {
+              // Notification delivery is best-effort
+            }
           } catch (bgError: unknown) {
             if (worktree) {
               await cleanupWorktree(worktree);
@@ -777,23 +814,40 @@ server.tool(
               bgError instanceof Error ? bgError.message : String(bgError);
             await writeFile(
               outputFile,
-              JSON.stringify({ status: "error", error: msg }, null, 2),
+              JSON.stringify({
+                status: "error",
+                task_id: taskId,
+                description,
+                error: msg,
+              }, null, 2),
             ).catch(() => {});
             console.error(
               `[task-external] Background task failed: "${description}" - ${msg}`,
             );
+
+            try {
+              await server.server.notification({
+                method: "notifications/resources/updated",
+                params: {
+                  uri: `task://${taskId}`,
+                  description: `Background task "${description}" failed: ${msg}`,
+                },
+              });
+            } catch {
+              // best-effort
+            }
           }
         })();
 
         console.error(
-          `[task-external] Background task launched: "${description}" → ${outputFile}`,
+          `[task-external] Background task launched: "${description}" (taskId=${taskId}) → ${outputFile}`,
         );
 
         return {
           content: [
             {
               type: "text" as const,
-              text: `Task "${description}" launched in background.\n[output_file: ${outputFile}]`,
+              text: `Task "${description}" launched in background.\nCommand running in background with ID: ${taskId}.\nOutput is being written to: ${outputFile}\n[task_id: ${taskId}]\n[output_file: ${outputFile}]`,
             },
           ],
         };
@@ -1242,6 +1296,109 @@ server.tool(
         isError: true,
       };
     }
+  },
+);
+
+// --- TaskOutput tool ---
+// Mirrors Claude Code's native TaskOutput tool so the main agent can
+// check on background tasks with block=true/false semantics.
+
+server.tool(
+  "TaskOutput",
+  `Retrieves output from a running or completed background task.
+- Takes a task_id parameter identifying the task
+- Returns the task output along with status information
+- Use block=true (default) to wait for task completion
+- Use block=false for non-blocking check of current status
+- Returns status: "running", "completed", or "error"`,
+  {
+    task_id: z.string().describe("The task ID to get output from"),
+    block: z
+      .boolean()
+      .optional()
+      .default(true)
+      .describe("Whether to wait for completion"),
+    timeout: z
+      .number()
+      .optional()
+      .default(30000)
+      .describe("Max wait time in ms"),
+  },
+  async (params) => {
+    const { task_id, block, timeout } = params;
+    const effectiveTimeout = Math.min(timeout ?? 30000, 600000);
+
+    console.error(
+      `[task-external] TaskOutput: task_id=${task_id}, block=${block}, timeout=${effectiveTimeout}`,
+    );
+
+    // Find the output file by scanning tmp for matching task_id
+    const outputFile = join(tmpdir(), `task-external-bg-${task_id}.json`);
+
+    const readResult = async (): Promise<{ status: string; [key: string]: unknown } | null> => {
+      try {
+        const raw = await readFile(outputFile, "utf-8");
+        return JSON.parse(raw);
+      } catch {
+        return null;
+      }
+    };
+
+    if (!block) {
+      // Non-blocking: return current status immediately
+      const data = await readResult();
+      if (!data) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: `No task found with ID: ${task_id}`,
+          }],
+          isError: true,
+        };
+      }
+      if (data.status === "running") {
+        return {
+          content: [{
+            type: "text" as const,
+            text: `Task ${task_id} is still running.\n[status: running]\n[output_file: ${outputFile}]`,
+          }],
+        };
+      }
+      return {
+        content: [{
+          type: "text" as const,
+          text: data.status === "completed"
+            ? `${(data.result as string) ?? ""}\n[status: completed]\n[task_id: ${task_id}]`
+            : `Task ${task_id} failed: ${(data.error as string) ?? "unknown error"}\n[status: error]\n[task_id: ${task_id}]`,
+        }],
+        isError: data.status === "error",
+      };
+    }
+
+    // Blocking: poll until completed or timeout
+    const deadline = Date.now() + effectiveTimeout;
+    while (Date.now() < deadline) {
+      const data = await readResult();
+      if (data && data.status !== "running") {
+        return {
+          content: [{
+            type: "text" as const,
+            text: data.status === "completed"
+              ? `${(data.result as string) ?? ""}\n[status: completed]\n[task_id: ${task_id}]`
+              : `Task ${task_id} failed: ${(data.error as string) ?? "unknown error"}\n[status: error]\n[task_id: ${task_id}]`,
+          }],
+          isError: data.status === "error",
+        };
+      }
+      await sleep(1000);
+    }
+
+    return {
+      content: [{
+        type: "text" as const,
+        text: `TaskOutput timed out after ${effectiveTimeout}ms. Task ${task_id} is still running.\n[status: running]\n[output_file: ${outputFile}]`,
+      }],
+    };
   },
 );
 
