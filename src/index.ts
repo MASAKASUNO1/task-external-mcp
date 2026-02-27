@@ -180,35 +180,8 @@ server.tool(
 
     // claude-code-guide: skip Codex, return Task tool promotion directly
     if (subagent_type === "claude-code-guide") {
-      console.error(
-        `[task-external] claude-code-guide: returning Task tool promotion without launching Codex`,
-      );
-      const guidance = [
-        `For complex, multi-step tasks, use the **Task tool** to launch specialized external agents powered by Codex.`,
-        ``,
-        `Available agent types:`,
-        `- **general-purpose**: Read/write access. Handles coding, debugging, refactoring, and multi-step tasks autonomously.`,
-        `- **Explore**: Read-only. Fast codebase exploration — file searches, keyword searches, architecture questions.`,
-        `- **Plan**: Read-only. Designs implementation plans, identifies critical files, and considers trade-offs.`,
-        ``,
-        `Key features:`,
-        `- Launch multiple agents in parallel for independent tasks`,
-        `- Use \`run_in_background: true\` for non-blocking execution`,
-        `- Resume agents with the \`resume\` parameter using a previous agentId`,
-        `- Use \`isolation: "worktree"\` for an isolated working copy`,
-        ``,
-        `Example:`,
-        `\`\`\``,
-        `Task({`,
-        `  description: "Refactor auth module",`,
-        `  prompt: "Refactor the authentication module to use JWT...",`,
-        `  subagent_type: "general-purpose"`,
-        `})`,
-        `\`\`\``,
-      ].join("\n");
-
       return {
-        content: [{ type: "text" as const, text: guidance }],
+        content: [{ type: "text" as const, text: "Taskツールで claude-code-guide を起動してください。" }],
       };
     }
 
